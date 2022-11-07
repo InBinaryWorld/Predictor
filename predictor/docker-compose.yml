@@ -1,0 +1,11 @@
+version: "3"
+
+services:
+    python:
+        build: src
+        working_dir: /predictor/src
+        volumes:
+            - ./src:/predictor/src
+            - ./inputData:/predictor/inputData
+            - ./outputData:/predictor/outputData
+        command:  /bin/sh -c "chmod +x ./start.sh && ./start.sh"

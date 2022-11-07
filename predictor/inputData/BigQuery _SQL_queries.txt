@@ -1,0 +1,456 @@
+base_projects
+
+SELECT
+    projects.id,
+    projects.language,
+    projects.url,
+    CASE 
+        WHEN projects.created_at < commits.first_commit_date THEN projects.created_at
+        ELSE commits.first_commit_date
+    END AS created_at
+FROM 
+        (SELECT repo_id FROM `ghtorrent-bq.ght_2017_09_01.watchers` GROUP BY repo_id ORDER BY COUNT(*) DESC LIMIT 1000) AS ids
+    LEFT JOIN
+        (SELECT id, language, url, created_at, forked_from, deleted FROM `ghtorrent-bq.ght_2017_09_01.projects`) AS projects
+    ON ids.repo_id = projects.id
+    LEFT JOIN
+        (SELECT project_id, min(created_at) as first_commit_date FROM `ghtorrent-bq.ght_2017_09_01.commits` GROUP BY project_id) AS commits
+    ON ids.repo_id = commits.project_id
+    LEFT JOIN
+        (SELECT repo_id, count(*) as issues_count FROM `ghtorrent-bq.ght_2017_09_01.issues` GROUP BY repo_id) AS issues 
+    ON ids.repo_id = issues.repo_id
+WHERE
+    projects.language IS NOT NULL 
+    AND projects.forked_from IS NULL
+    AND projects.deleted IS FALSE
+    AND issues.issues_count > 0;
+
+	
+-----------------------------------------------------------------------------------------------------------------------
+
+base_users
+
+SELECT
+    users.id,
+    users.fake,
+    CASE 
+        WHEN users.created_at < commits.first_commit_date THEN users.created_at
+        ELSE commits.first_commit_date
+    END AS created_at
+FROM 
+        (SELECT id, fake, created_at FROM `ghtorrent-bq.ght_2017_09_01.users`) AS users
+    LEFT JOIN
+        (SELECT committer_id, min(created_at) as first_commit_date FROM `ghtorrent-bq.ght_2017_09_01.commits` GROUP BY committer_id) AS commits
+    ON users.id = commits.committer_id
+	
+	
+-----------------------------------------------------------------------------------------------------------------------
+
+base_commits_data
+
+SELECT 
+    commits.project_id, 
+    commits.committer_id,
+    min(commits.created_at) AS first_commit_date,
+    date_diff(max(commits.created_at), min(commits.created_at), DAY) AS commiting_days,
+    date_diff(TIMESTAMP(<<DB_DROP_DATE>>), min(commits.created_at), DAY) AS days_from_first_commit,
+FROM `ghtorrent-bq.ght_2017_09_01.commits` AS commits
+GROUP BY commits.committer_id, commits.project_id
+
+-----------------------------------------------------------------------------------------------------------------------
+
+base_LTC
+
+SELECT
+    base.id AS repo_id,
+    base.created_at AS repo_create_date,
+    base.language AS repo_lang,
+    commits.committer_id AS contributor_id,
+    commits.first_commit_date AS join_date,
+    CASE
+        WHEN commits.commiting_days / 365.0 < <<LTC_TRESHHOLD>> THEN FALSE
+        ELSE TRUE    
+    END AS LTC
+FROM 
+        (SELECT min(id) as id FROM `mgr-github.github_views.base_projects` GROUP BY url) AS ids
+    INNER JOIN 
+        (SELECT id, language, created_at FROM `mgr-github.github_views.base_projects`) AS base 
+    ON ids.id = base.id
+    INNER JOIN
+        `mgr-github.github_views.base_commits_data` AS commits
+    ON base.id = commits.project_id
+WHERE commits.days_from_first_commit / 365.0 > <<LTC_TRESHHOLD>>
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_R_watchers
+
+SELECT 
+    base_ltc.repo_id, 
+    base_ltc.contributor_id, 
+    COUNT(watchers.created_at) AS number_of_wathers_before_join
+FROM 
+        (SELECT repo_id, contributor_id, join_date FROM `mgr-github.github_views.base_LTC`) as base_ltc
+    LEFT JOIN 
+       (SELECT repo_id, min(created_at) AS created_at FROM `ghtorrent-bq.ght_2017_09_01.watchers` GROUP BY repo_id, user_id) AS watchers 
+    ON base_ltc.repo_id = watchers.repo_id AND base_ltc.join_date > watchers.created_at
+GROUP BY base_ltc.repo_id, base_ltc.contributor_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_R_contributors
+
+SELECT 
+    contributors.repo_id, 
+    contributors.contributor_id, 
+    COUNT(contributors.committer_id) AS number_of_contributors_before_join, 
+    min(contributors.number_of_commiter_commits_before_join) AS min_number_of_commits_before_join, 
+    max(contributors.number_of_commiter_commits_before_join) AS max_number_of_commits_before_join,
+    min(contributors.days_in_project) AS min_number_of_contributing_days_before_join,
+    max(contributors.days_in_project) AS max_number_of_contributing_days_before_join,
+    IFNULL(min(contributors.days_from_last_commit), 0) AS days_from_last_commit,
+    IFNULL(avg(contributors.c_involvement),0.5) AS avg_c_involvement
+FROM 
+    (SELECT
+        repo_id, contributor_id, committer_id, number_of_commiter_commits_before_join, days_from_last_commit, days_in_project,
+        CASE 
+            WHEN days_from_first_commit IS NULL OR days_from_first_commit < 30 THEN NULL
+            WHEN days_in_project > 365 * <<LTC_TRESHHOLD>> THEN 1 
+            WHEN days_from_first_commit > 365 * <<LTC_TRESHHOLD>> THEN (days_in_project + 0.0)/ (365 * <<LTC_TRESHHOLD>>)
+            ELSE (days_in_project + 0.0) / days_from_first_commit
+        END AS c_involvement
+    FROM
+        (SELECT 
+            base_ltc.repo_id, base_ltc.contributor_id, commits.committer_id,
+            date_diff(join_date, max(commits.created_at), day) AS days_from_last_commit,
+            date_diff(join_date, min(commits.created_at), day) AS days_from_first_commit,
+            IFNULL(date_diff(max(commits.created_at), min(commits.created_at), day), 0) AS days_in_project,
+            COUNT(commits.created_at) AS number_of_commiter_commits_before_join
+        FROM 
+                (SELECT repo_id, contributor_id, join_date FROM `mgr-github.github_views.base_LTC`) as base_ltc
+            LEFT JOIN 
+                (SELECT project_id, committer_id, created_at FROM `ghtorrent-bq.ght_2017_09_01.commits`) AS commits
+            ON base_ltc.repo_id = commits.project_id AND base_ltc.join_date > commits.created_at
+        GROUP BY base_ltc.repo_id, base_ltc.contributor_id, base_ltc.join_date, commits.committer_id)
+    ) AS contributors 
+GROUP BY contributors.repo_id, contributors.contributor_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_R_issues
+
+SELECT 
+    base_ltc.repo_id, 
+    base_ltc.contributor_id, 
+    COUNT(issues.created_at) AS number_of_issues_before_join
+FROM 
+        (SELECT repo_id, contributor_id, join_date FROM `mgr-github.github_views.base_LTC`) as base_ltc
+    LEFT JOIN 
+       (SELECT repo_id, created_at FROM `ghtorrent-bq.ght_2017_09_01.issues`) AS issues 
+    ON base_ltc.repo_id = issues.repo_id AND base_ltc.join_date > issues.created_at
+GROUP BY base_ltc.repo_id, base_ltc.contributor_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_R_pull_requests
+
+SELECT 
+    base_ltc.repo_id, 
+    base_ltc.contributor_id,
+    COUNT(requests_h.created_at) AS num_of_pull_requests
+FROM 
+        (SELECT repo_id, contributor_id, repo_lang, join_date FROM `mgr-github.github_views.base_LTC`) AS base_ltc
+    LEFT JOIN 
+        (SELECT base_repo_id, id FROM `ghtorrent-bq.ght_2017_09_01.pull_requests`) AS requests
+    ON base_ltc.repo_id = requests.base_repo_id
+    LEFT JOIN
+        (SELECT created_at, pull_request_id  FROM `ghtorrent-bq.ght_2017_09_01.pull_request_history` WHERE action = 'merged') AS requests_h
+    ON requests.id = requests_h.pull_request_id AND base_ltc.join_date > requests_h.created_at 
+GROUP BY base_ltc.repo_id, base_ltc.contributor_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_watching_before
+
+SELECT 
+    base_ltc.repo_id, 
+    base_ltc.contributor_id, 
+    IFNULL(watchers.created_at < base_ltc.join_date, FALSE) AS is_watching_before_join_project
+FROM 
+        (SELECT repo_id, contributor_id, join_date FROM `mgr-github.github_views.base_LTC`) as base_ltc
+    LEFT JOIN 
+        (SELECT repo_id, user_id, min(created_at) AS created_at FROM `ghtorrent-bq.ght_2017_09_01.watchers` GROUP BY repo_id, user_id) AS watchers 
+    ON base_ltc.contributor_id = watchers.user_id AND base_ltc.repo_id = watchers.repo_id
+	
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_own_repos
+
+SELECT 
+    base_ltc.repo_id, 
+    base_ltc.contributor_id,
+    COUNT(projects.created_at) AS own_repo_with_lang
+FROM 
+        (SELECT repo_id, contributor_id, join_date, repo_lang FROM`mgr-github.github_views.base_LTC`) as base_ltc
+    LEFT JOIN 
+        (SELECT owner_id, language, created_at FROM `ghtorrent-bq.ght_2017_09_01.projects`) AS projects 
+    ON base_ltc.contributor_id = projects.owner_id AND base_ltc.repo_lang = projects.language AND base_ltc.join_date > projects.created_at
+GROUP BY base_ltc.contributor_id, base_ltc.repo_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_watching_repos
+
+SELECT 
+    base_ltc.repo_id, 
+    base_ltc.contributor_id,
+    COUNT(projects.language) AS watch_repo_with_lang
+FROM 
+        (SELECT repo_id, contributor_id, join_date, repo_lang FROM`mgr-github.github_views.base_LTC`) as base_ltc
+    LEFT JOIN 
+        (SELECT repo_id, user_id, min(created_at) AS created_at FROM `ghtorrent-bq.ght_2017_09_01.watchers` GROUP BY repo_id, user_id ) AS watchers 
+    ON base_ltc.contributor_id = watchers.user_id AND base_ltc.join_date > watchers.created_at 
+    LEFT JOIN 
+        (SELECT id, language FROM `ghtorrent-bq.ght_2017_09_01.projects`) AS projects 
+    ON watchers.repo_id = projects.id AND base_ltc.repo_lang = projects.language
+GROUP BY base_ltc.contributor_id, base_ltc.repo_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_contributing_repos
+
+SELECT 
+    repository_commits.repo_id, 
+    repository_commits.contributor_id,
+    COUNT(projects.language) AS contribute_repo_with_lang,
+    SUM(repository_commits.num_of_commits) AS contribute_repo_with_lang_commits
+FROM 
+        (SELECT 
+            base_ltc.repo_id, 
+            base_ltc.contributor_id,
+            base_ltc.repo_lang,
+            commits.project_id AS commiting_repo_id,
+            COUNT(commits.created_at) AS num_of_commits
+        FROM 
+                (SELECT repo_id, contributor_id, repo_lang, join_date FROM `mgr-github.github_views.base_LTC`) as base_ltc
+            LEFT JOIN 
+                (SELECT project_id, committer_id, created_at FROM `ghtorrent-bq.ght_2017_09_01.commits`) AS commits
+            ON base_ltc.contributor_id = commits.committer_id AND base_ltc.join_date > commits.created_at 
+            GROUP BY base_ltc.repo_id, base_ltc.contributor_id, base_ltc.repo_lang, commits.project_id) AS repository_commits
+    LEFT JOIN 
+        (SELECT id, language  FROM `ghtorrent-bq.ght_2017_09_01.projects`) AS projects 
+    ON repository_commits.commiting_repo_id = projects.id AND repository_commits.repo_lang = projects.language
+GROUP BY repository_commits.contributor_id, repository_commits.repo_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_pull_requests
+
+SELECT 
+    repository_requests.repo_id, 
+    repository_requests.contributor_id,
+    SUM(repository_requests.num_of_pull_requests) AS pull_requests_with_lang
+FROM 
+        (SELECT 
+            base_ltc.repo_id, 
+            base_ltc.contributor_id,
+            base_ltc.repo_lang,
+            requests.base_repo_id AS pull_request_repo_id,
+            COUNT(requests.id) AS num_of_pull_requests
+        FROM 
+                (SELECT repo_id, contributor_id, repo_lang, join_date FROM `mgr-github.github_views.base_LTC`) AS base_ltc
+            LEFT JOIN 
+                (SELECT actor_id, created_at, pull_request_id FROM `ghtorrent-bq.ght_2017_09_01.pull_request_history` WHERE action = 'merged') AS requests_h
+            ON base_ltc.contributor_id = requests_h.actor_id AND base_ltc.join_date > requests_h.created_at 
+            LEFT JOIN 
+                `ghtorrent-bq.ght_2017_09_01.pull_requests` AS requests
+            ON requests_h.pull_request_id = requests.id 
+            GROUP BY base_ltc.repo_id, base_ltc.contributor_id, base_ltc.repo_lang, requests.base_repo_id) AS repository_requests
+    LEFT JOIN 
+        (SELECT id, language  FROM `ghtorrent-bq.ght_2017_09_01.projects`) AS projects 
+    ON repository_requests.pull_request_repo_id  = projects.id AND repository_requests.repo_lang = projects.language
+GROUP BY repository_requests.contributor_id, repository_requests.repo_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_issues
+
+SELECT 
+    repository_requests.repo_id, 
+    repository_requests.contributor_id,
+    SUM(repository_requests.num_of_issues) AS issues_with_lang
+FROM 
+        (SELECT 
+            base_ltc.repo_id, 
+            base_ltc.contributor_id,
+            base_ltc.repo_lang,
+            requests.base_repo_id AS issues_repo_id,
+            COUNT(requests.id) AS num_of_issues
+        FROM 
+                (SELECT repo_id, contributor_id, repo_lang, join_date FROM `mgr-github.github_views.base_LTC`) as base_ltc
+            LEFT JOIN 
+                (SELECT reporter_id, created_at, pull_request_id FROM `ghtorrent-bq.ght_2017_09_01.issues`) AS issues
+            ON base_ltc.contributor_id = issues.reporter_id AND base_ltc.join_date > issues.created_at 
+            LEFT JOIN 
+                (SELECT id, base_repo_id FROM `ghtorrent-bq.ght_2017_09_01.pull_requests`) AS requests
+            ON issues.pull_request_id = requests.id 
+            GROUP BY base_ltc.repo_id, base_ltc.contributor_id, base_ltc.repo_lang, requests.base_repo_id) AS repository_requests
+    LEFT JOIN 
+        (SELECT id, language FROM `ghtorrent-bq.ght_2017_09_01.projects`) AS projects 
+    ON repository_requests.issues_repo_id  = projects.id AND repository_requests.repo_lang = projects.language
+GROUP BY repository_requests.contributor_id, repository_requests.repo_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_followers
+
+SELECT 
+    base_ltc.repo_id, 
+    base_ltc.contributor_id, 
+    COUNT(followers.created_at) AS number_of_followers_before_join
+FROM 
+        (SELECT repo_id, contributor_id, join_date FROM `mgr-github.github_views.base_LTC`) AS base_ltc
+    LEFT JOIN 
+        (SELECT user_id, min(created_at) AS created_at FROM `ghtorrent-bq.ght_2017_09_01.followers` GROUP BY user_id, follower_id) AS followers 
+    ON base_ltc.contributor_id = followers.user_id AND base_ltc.join_date > followers.created_at
+GROUP BY base_ltc.repo_id, base_ltc.contributor_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_following
+
+SELECT 
+    base_ltc.repo_id, 
+    base_ltc.contributor_id, 
+    COUNT(followers.created_at) AS number_of_following_before_join
+FROM 
+        (SELECT repo_id, contributor_id, join_date FROM `mgr-github.github_views.base_LTC`) AS base_ltc
+    LEFT JOIN 
+        (SELECT follower_id, min(created_at) AS created_at FROM `ghtorrent-bq.ght_2017_09_01.followers` GROUP BY user_id, follower_id) AS followers 
+    ON base_ltc.contributor_id = followers.follower_id AND base_ltc.join_date > followers.created_at
+GROUP BY base_ltc.repo_id, base_ltc.contributor_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_U_repos
+
+SELECT 
+    repositories.repo_id, 
+    repositories.contributor_id, 
+    COUNT(repositories.project_id) AS number_of_reposiories_before_join, 
+    min(repositories.number_of_repo_commits_before_join) AS min_number_of_commits_before_join, 
+    max(repositories.number_of_repo_commits_before_join) AS max_number_of_commits_before_join,
+    min(repositories.days_in_project) AS min_number_of_days_in_any_project_before_join,
+    max(repositories.days_in_project) AS max_number_of_days_in_any_project_before_join,
+    IFNULL(avg(repositories.r_involvement),0.5) AS avg_r_involvement
+FROM 
+    (SELECT
+        repo_id, contributor_id, project_id, number_of_repo_commits_before_join, days_in_project,
+        CASE 
+            WHEN days_from_first_commit IS NULL OR days_from_first_commit < 30 THEN NULL
+            WHEN days_in_project > 365 * <<LTC_TRESHHOLD>> THEN 1 
+            WHEN days_from_first_commit > 365 * <<LTC_TRESHHOLD>> THEN (days_in_project + 0.0)/ (365 * <<LTC_TRESHHOLD>>)
+            ELSE (days_in_project + 0.0) / days_from_first_commit
+        END AS r_involvement
+    FROM
+        (SELECT 
+            base_ltc.repo_id, base_ltc.contributor_id, commits.project_id,
+            date_diff(join_date, min(commits.created_at), day) AS days_from_first_commit,
+            IFNULL(date_diff(max(commits.created_at), min(commits.created_at), day), 0) AS days_in_project,
+            COUNT(commits.created_at) AS number_of_repo_commits_before_join
+        FROM 
+                (SELECT repo_id, contributor_id, join_date  FROM `mgr-github.github_views.base_LTC`) as base_ltc
+            LEFT JOIN 
+                (SELECT project_id, committer_id, created_at FROM `ghtorrent-bq.ght_2017_09_01.commits`) AS commits
+            ON base_ltc.contributor_id = commits.committer_id AND base_ltc.join_date > commits.created_at
+        GROUP BY base_ltc.repo_id, base_ltc.contributor_id, base_ltc.join_date, commits.project_id) 
+    ) AS repositories 
+GROUP BY repositories.repo_id, repositories.contributor_id
+
+-------------------------------------------------------------------------------------------------------------------
+
+LTC_final
+
+
+SELECT 
+        base_ltc.repo_id,
+        base_ltc.contributor_id,
+        base_ltc.join_date,
+        base_ltc.LTC,
+        
+        base_ltc.repo_lang AS r_Language,
+        date_diff(base_ltc.join_date, base_ltc.repo_create_date, DAY) AS r_Age,
+        watchers.number_of_wathers_before_join AS r_Number_of_Watchers,
+        contributors.number_of_contributors_before_join AS r_Number_of_Contributors,
+        contributors.min_number_of_commits_before_join AS r_Min_All_Contributor_Commits,
+        contributors.max_number_of_commits_before_join AS r_Max_All_Contributor_Commits,
+        contributors.min_number_of_contributing_days_before_join AS r_Min_All_Contributor_Stay,
+        contributors.max_number_of_contributing_days_before_join AS r_Max_All_Contributor_Stay,
+        contributors.avg_c_involvement AS r_Avg_Contributor_Involvement,
+        contributors.days_from_last_commit AS r_Days_From_Last_Commit,
+        issues.number_of_issues_before_join AS r_Number_of_Issues,
+        pull_requests.num_of_pull_requests AS r_Number_of_Pull_Requests,
+
+        users.fake AS c_is_Fake,
+        date_diff(base_ltc.join_date, users.created_at, day) AS c_Age,
+        u_watching_before.is_watching_before_join_project AS c_is_Watching_Project,
+        u_own_repos.own_repo_with_lang AS c_Own_Repos_Lang,
+        u_watching_repos.watch_repo_with_lang AS c_Watch_Repos_Lang,
+        u_contribute_repos.contribute_repo_with_lang AS c_Contribute_Repos_Lang,
+        u_contribute_repos.contribute_repo_with_lang_commits AS c_History_Commits_Lang,
+        u_pull_requests.pull_requests_with_lang AS c_History_Pull_Request_Lang,
+        u_issues.issues_with_lang AS c_History_Issues_Lang,
+        u_followers.number_of_followers_before_join AS c_History_Followers,
+        u_following.number_of_following_before_join AS c_History_Following,
+        u_repos.number_of_reposiories_before_join AS c_Number_of_Repos,
+        u_repos.min_number_of_commits_before_join AS c_Min_All_Repos_Commits,
+        u_repos.max_number_of_commits_before_join AS c_Max_All_Repos_Commits,
+        u_repos.min_number_of_days_in_any_project_before_join AS c_Min_All_Repos_Stay,
+        u_repos.max_number_of_days_in_any_project_before_join AS c_Max_All_Repos_Stay,
+        u_repos.avg_r_involvement AS c_Avg_Repository_Involvement
+FROM 
+        `mgr-github.github_views.base_LTC` as base_ltc
+    LEFT JOIN
+        `mgr-github.github_views.base_users` AS users 
+    ON base_ltc.contributor_id = users.id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_R_watchers` as watchers
+    ON base_ltc.repo_id = watchers.repo_id AND base_ltc.contributor_id = watchers.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_R_contributors` as contributors
+    ON base_ltc.repo_id = contributors.repo_id AND base_ltc.contributor_id = contributors.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_R_issues` as issues
+    ON base_ltc.repo_id = issues.repo_id AND base_ltc.contributor_id = issues.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_R_pull_requests` as pull_requests
+    ON base_ltc.repo_id = pull_requests.repo_id AND base_ltc.contributor_id = pull_requests.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_watching_before` as u_watching_before
+    ON base_ltc.repo_id = u_watching_before.repo_id AND base_ltc.contributor_id = u_watching_before.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_own_repos` as u_own_repos
+    ON base_ltc.repo_id = u_own_repos.repo_id AND base_ltc.contributor_id = u_own_repos.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_watching_repos` as u_watching_repos
+    ON base_ltc.repo_id = u_watching_repos.repo_id AND base_ltc.contributor_id = u_watching_repos.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_contributing_repos` as u_contribute_repos
+    ON base_ltc.repo_id = u_contribute_repos.repo_id AND base_ltc.contributor_id = u_contribute_repos.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_pull_requests` as u_pull_requests
+    ON base_ltc.repo_id = u_pull_requests.repo_id AND base_ltc.contributor_id = u_pull_requests.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_issues` as u_issues
+    ON base_ltc.repo_id = u_issues.repo_id AND base_ltc.contributor_id = u_issues.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_followers` as u_followers
+    ON base_ltc.repo_id = u_followers.repo_id AND base_ltc.contributor_id = u_followers.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_following` as u_following
+    ON base_ltc.repo_id = u_following.repo_id AND base_ltc.contributor_id = u_following.contributor_id
+    LEFT JOIN
+        `mgr-github.github_views.LTC_U_repos` as u_repos
+    ON base_ltc.repo_id = u_repos.repo_id AND base_ltc.contributor_id = u_repos.contributor_id
+
+
